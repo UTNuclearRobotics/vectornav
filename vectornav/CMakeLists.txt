@@ -22,10 +22,14 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(vectornav_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+
+find_package(Eigen3 REQUIRED)
 
 # vncxx
 add_subdirectory(vnproglib-1.2.0.0/cpp)
@@ -45,7 +49,7 @@ target_link_libraries(${PROJECT_NAME} vncxx ${PROJECT_NAME}_lib)
 # vn_sensor_msgs library (with composable node)
 add_library(vn_sensor_msgs_lib SHARED src/vn_sensor_msgs.cc)
 ament_target_dependencies(vn_sensor_msgs_lib
-  rclcpp rclcpp_components sensor_msgs vectornav_msgs tf2_geometry_msgs)
+  rclcpp rclcpp_components nav_msgs sensor_msgs std_srvs vectornav_msgs tf2_geometry_msgs Eigen3)
 rclcpp_components_register_nodes(vn_sensor_msgs_lib "vectornav::VnSensorMsgs")
 
 # vn_sensor_msgs node

@@ -16,6 +16,10 @@
 #include <rclcpp_components/register_node_macro.hpp>
 #include <string>
 
+#include <Eigen/Dense>
+
+#include <tf2/utils.hpp>
+
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 using namespace std::chrono_literals;
@@ -58,6 +62,7 @@ VnSensorMsgs::VnSensorMsgs(const rclcpp::NodeOptions & options) : Node("vn_senso
     "vectornav/velocity_body", 10);
   pub_pose_ =
     this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("vectornav/pose", 10);
+  odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", 10);
 
   //
   // Subscribers
@@ -90,9 +95,80 @@ VnSensorMsgs::VnSensorMsgs(const rclcpp::NodeOptions & options) : Node("vn_senso
   sub_vn_gps2_ = this->create_subscription<vectornav_msgs::msg::GpsGroup>(
     "vectornav/raw/gps2", 10, sub_vn_gps2_cb);
 
+  reset_enu_srv_ = this->create_service<std_srvs::srv::Empty>(
+    "reset_enu_odometry",
+    std::bind(&VnSensorMsgs::handleResetEnuOdometry, this,
+              std::placeholders::_1, std::placeholders::_2));
+
+
   //enu frame option
   use_enu = get_parameter("use_enu").as_bool();
 }
+
+
+void VnSensorMsgs::updateEnuInitialization(
+  const geometry_msgs::msg::PoseWithCovarianceStamped& enu_pose)
+{
+  if (enu_to_odom_) {
+    return;
+  }
+
+  const geometry_msgs::msg::Point& p = enu_pose.pose.pose.position;
+  const geometry_msgs::msg::Quaternion& q_msg = enu_pose.pose.pose.orientation;
+
+  tf2::Quaternion q;
+  tf2::fromMsg(q_msg, q);
+
+  const double yaw = tf2::getYaw(q);
+
+  enu_x_sum_ += p.x;
+  enu_y_sum_ += p.y;
+  enu_yaw_sin_sum_ += std::sin(yaw);
+  enu_yaw_cos_sum_ += std::cos(yaw);
+  ++enu_init_count_;
+
+  if (enu_init_count_ < ENU_INIT_WINDOW) {
+    return;
+  }
+
+  const double x0 = enu_x_sum_ / enu_init_count_;
+  const double y0 = enu_y_sum_ / enu_init_count_;
+  const double yaw0 =
+    std::atan2(enu_yaw_sin_sum_, enu_yaw_cos_sum_);
+
+  tf2::Quaternion q0;
+  q0.setRPY(0.0, 0.0, -yaw0);
+
+  tf2::Vector3 t0(-x0, -y0, 0.0);
+
+  tf2::Transform T;
+  T.setRotation(q0);
+  T.setOrigin(tf2::quatRotate(q0, t0));
+
+  enu_to_odom_ = T;
+}
+
+
+
+inline tf2::Transform makeEnuPoseTransform(
+  const geometry_msgs::msg::PoseWithCovarianceStamped& enu_pose)
+{
+  const geometry_msgs::msg::Point& p = enu_pose.pose.pose.position;
+  const geometry_msgs::msg::Quaternion& q_msg = enu_pose.pose.pose.orientation;
+
+  tf2::Quaternion q;
+  tf2::fromMsg(q_msg, q);
+
+  const double yaw = tf2::getYaw(q);
+
+  tf2::Quaternion q_yaw;
+  q_yaw.setRPY(0.0, 0.0, yaw);
+
+  return tf2::Transform(
+    q_yaw,
+    tf2::Vector3(p.x, p.y, 0.0));
+}
+
 
 
 static void convert_vec_frd_to_rfu(const geometry_msgs::msg::Vector3 & vec_frd, geometry_msgs::msg::Vector3 & vec_rfu)
@@ -117,7 +193,7 @@ static void convert_to_enu(const geometry_msgs::msg::Quaternion & q_msg_frd2ned,
 /** Convert VN common group data to ROS2 standard message types
    *
    */
-void VnSensorMsgs::sub_vn_common(const vectornav_msgs::msg::CommonGroup::SharedPtr msg_in) const
+void VnSensorMsgs::sub_vn_common(const vectornav_msgs::msg::CommonGroup::SharedPtr msg_in)
 {
   // RCLCPP_INFO(get_logger(), "Frame ID: '%s'", msg_in->header.frame_id.c_str());
 
@@ -304,11 +380,11 @@ void VnSensorMsgs::sub_vn_common(const vectornav_msgs::msg::CommonGroup::SharedP
     msg.pose.pose.position = ins_posecef_;
 
     // Converts Quaternion to ECEF
-    tf2::Quaternion q_frd2ned, q_ned2ecef;
+    tf2::Quaternion q_frd2ned;
     tf2::fromMsg(msg_in->quaternion, q_frd2ned);
-    auto latitude = deg2rad(msg_in->position.x);
-    auto longitude = deg2rad(msg_in->position.y);
-    q_ned2ecef = tf2::Quaternion(tf2::Vector3(0, 0, 1), longitude)
+    const double latitude = deg2rad(msg_in->position.x);
+    const double longitude = deg2rad(msg_in->position.y);
+    const tf2::Quaternion q_ned2ecef = tf2::Quaternion(tf2::Vector3(0, 0, 1), longitude)
                   * tf2::Quaternion(tf2::Vector3(0, 1, 0), -M_PI/2 - latitude);
 
     if (use_enu) {
@@ -320,11 +396,91 @@ void VnSensorMsgs::sub_vn_common(const vectornav_msgs::msg::CommonGroup::SharedP
       msg.pose.pose.orientation = tf2::toMsg(q_frd2ecef);
     }
 
-    /// TODO(Dereck): Pose Covariance
+    // naive covariance
+    static constexpr double POS_STD_SQR = 0.050*0.050;
+    static constexpr double YAW_STD_SQR = 0.1*0.1;
+
+    msg.pose.covariance.fill(0.0);
+    msg.pose.covariance[0]  = POS_STD_SQR;  // x-x
+    msg.pose.covariance[7]  = POS_STD_SQR;  // y-y
+    msg.pose.covariance[35] = YAW_STD_SQR; // yaw-yaw
 
     pub_pose_->publish(msg);
+    
+    updateEnuInitialization(msg);
+
+    publishOdomFromEnu(msg);
   }
 }
+
+/** Publish egocentric odometry
+   *
+   */
+void VnSensorMsgs::publishOdomFromEnu(
+  const geometry_msgs::msg::PoseWithCovarianceStamped& enu_pose)
+{
+  if (!odom_pub_ || !enu_to_odom_) {
+    return;
+  }
+
+  const auto & p = enu_pose.pose.pose.position;
+  const auto & q_msg = enu_pose.pose.pose.orientation;
+
+  tf2::Quaternion q;
+  tf2::fromMsg(q_msg, q);
+
+  const double yaw = tf2::getYaw(q);
+
+  tf2::Quaternion q_enu;
+  q_enu.setRPY(0.0, 0.0, yaw);
+
+  tf2::Transform enu_tf(q_enu, tf2::Vector3(p.x, p.y, 0.0));
+  tf2::Transform odom_tf = (*enu_to_odom_) * enu_tf;
+
+  nav_msgs::msg::Odometry msg;
+  msg.header.stamp = enu_pose.header.stamp;
+  msg.header.frame_id = "odom";
+  msg.child_frame_id = "base_link";
+
+  msg.pose.pose.position.x = odom_tf.getOrigin().x();
+  msg.pose.pose.position.y = odom_tf.getOrigin().y();
+  msg.pose.pose.position.z = 0.0;
+
+  const tf2::Quaternion & q_out = odom_tf.getRotation();
+  msg.pose.pose.orientation = tf2::toMsg(q_out);
+
+  // Rotate planar covariance
+  Eigen::Matrix3d cov_enu;
+  cov_enu <<
+    enu_pose.pose.covariance[0], enu_pose.pose.covariance[1], enu_pose.pose.covariance[5],
+    enu_pose.pose.covariance[6], enu_pose.pose.covariance[7], enu_pose.pose.covariance[11],
+    enu_pose.pose.covariance[30], enu_pose.pose.covariance[31], enu_pose.pose.covariance[35];
+
+  const double theta = tf2::getYaw(enu_to_odom_->getRotation());
+  const double c = std::cos(theta);
+  const double s = std::sin(theta);
+
+  Eigen::Matrix3d J;
+  J << c, -s, 0.0,
+       s,  c, 0.0,
+       0.0,0.0,1.0;
+
+  const Eigen::Matrix3d cov_odom = J * cov_enu * J.transpose();
+
+  std::fill(msg.pose.covariance.begin(), msg.pose.covariance.end(), 0.0);
+  msg.pose.covariance[0]  = cov_odom(0,0);
+  msg.pose.covariance[1]  = cov_odom(0,1);
+  msg.pose.covariance[6]  = cov_odom(1,0);
+  msg.pose.covariance[7]  = cov_odom(1,1);
+  msg.pose.covariance[5]  = cov_odom(0,2);
+  msg.pose.covariance[11] = cov_odom(1,2);
+  msg.pose.covariance[30] = cov_odom(2,0);
+  msg.pose.covariance[31] = cov_odom(2,1);
+  msg.pose.covariance[35] = cov_odom(2,2);
+
+  odom_pub_->publish(msg);
+}
+
 
 /** Convert VN time group data to ROS2 standard message types
    *
@@ -405,7 +561,26 @@ void VnSensorMsgs::fill_covariance_from_param(
         length);
   }
 }
+
+void VnSensorMsgs::handleResetEnuOdometry(
+    const std::shared_ptr<std_srvs::srv::Empty::Request> /*request*/,
+    std::shared_ptr<std_srvs::srv::Empty::Response> /*response*/)
+{
+    // Clear running averages
+    enu_x_sum_ = 0.0;
+    enu_y_sum_ = 0.0;
+    enu_yaw_sin_sum_ = 0.0;
+    enu_yaw_cos_sum_ = 0.0;
+    enu_init_count_ = 0;
+
+    // Clear transform
+    enu_to_odom_.reset();
+
+    RCLCPP_INFO(this->get_logger(), "ENU odometry reset.");
 }
+
+} // namespace
+
 
 
 RCLCPP_COMPONENTS_REGISTER_NODE(vectornav::VnSensorMsgs)
