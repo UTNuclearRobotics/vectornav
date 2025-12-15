@@ -62,7 +62,7 @@ VnSensorMsgs::VnSensorMsgs(const rclcpp::NodeOptions & options) : Node("vn_senso
     "vectornav/velocity_body", 10);
   pub_pose_ =
     this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("vectornav/pose", 10);
-  odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", 10);
+  odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("vectornav/odom", 10);
 
   //
   // Subscribers
