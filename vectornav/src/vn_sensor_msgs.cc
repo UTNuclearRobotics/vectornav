@@ -15,6 +15,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <string>
+#include <algorithm>
 
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
@@ -35,6 +36,11 @@ VnSensorMsgs::VnSensorMsgs(const rclcpp::NodeOptions & options) : Node("vn_senso
   declare_parameter<std::vector<double>>(
     "linear_acceleration_covariance", linear_acceleration_covariance_);
   declare_parameter<std::vector<double>>("magnetic_covariance", magnetic_field_covariance_);
+
+  // GNSS quality handling
+  declare_parameter<double>("gps_max_horizontal_sigma", 8.0);  // m (1-sigma); worse -> STATUS_NO_FIX
+  declare_parameter<double>("gps_sigma_floor", 0.0);           // m; never report better than this
+  declare_parameter<double>("gps_covariance_scale", 1.0);      // multiplies variance
 
   //
   // Publishers
@@ -257,8 +263,14 @@ void VnSensorMsgs::sub_vn_common(const vectornav_msgs::msg::CommonGroup::SharedP
     sensor_msgs::msg::NavSatFix msg;
     msg.header = msg_in->header;
 
-    // Status
-    if (gps_fix_ == vectornav_msgs::msg::GpsGroup::GPSFIX_NOFIX) {
+    // posU: receiver's 1-sigma position uncertainty in metres, NED order (x=N, y=E, z=D)
+    const double max_sigma   = get_parameter("gps_max_horizontal_sigma").as_double();
+    const double sigma_floor = get_parameter("gps_sigma_floor").as_double();
+    const double cov_scale   = get_parameter("gps_covariance_scale").as_double();
+
+    // Status: reject no-fix and fixes whose horizontal uncertainty is too large
+    const double horiz_sigma = std::max(gps_posu_.x, gps_posu_.y);
+    if (gps_fix_ == vectornav_msgs::msg::GpsGroup::GPSFIX_NOFIX || horiz_sigma > max_sigma) {
       msg.status.status = sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
     } else {
       msg.status.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
@@ -269,11 +281,15 @@ void VnSensorMsgs::sub_vn_common(const vectornav_msgs::msg::CommonGroup::SharedP
     msg.longitude = msg_in->position.y;
     msg.altitude = msg_in->position.z;
 
-    // Covariance (Convert NED to ENU)
-    /// TODO(Dereck): Use DOP for better estimate?
-    const std::vector<double> orientation_covariance_ = {
-      gps_posu_.y, 0.0000, 0.0000, 0.0000, gps_posu_.x, 0.0000, 0.0000, 0.0000, gps_posu_.z};
-
+    // Covariance: sigma -> variance (with optional floor/scale), NED -> ENU ordering
+    auto var = [&](double sigma) {
+      sigma = std::max(sigma, sigma_floor);
+      return cov_scale * sigma * sigma;
+    };
+    msg.position_covariance = {
+      var(gps_posu_.y), 0.0, 0.0,   // East
+      0.0, var(gps_posu_.x), 0.0,   // North
+      0.0, 0.0, var(gps_posu_.z)};  // Up
     msg.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
 
     pub_gnss_->publish(msg);
